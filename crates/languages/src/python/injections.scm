@@ -15,7 +15,7 @@
                 (comment) @comment
                 (string
                     (string_content) @injection.content
-                )
+                ) @injection.host
         ))
 
         ; string variables
@@ -25,11 +25,10 @@
                 (assignment
                     right: (string
                         (string_content) @injection.content
-                    )
+                    ) @injection.host
                 )
         ))
     ]
     (#match? @comment "^(#|#\\s+)(?i:sql)\\s*$")
     (#set! injection.language "sql")
-    (#set! injection.combined)
 )
