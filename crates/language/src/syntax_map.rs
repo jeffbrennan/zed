@@ -1532,7 +1532,10 @@ fn get_injections(
     language_registry: &Arc<LanguageRegistry>,
     depth: usize,
     changed_ranges: &[Range<usize>],
-    combined_injection_ranges: &mut HashMap<LanguageId, (Arc<Language>, Vec<tree_sitter::Range>)>,
+    combined_injection_ranges: &mut HashMap<
+        (LanguageId, Option<usize>),
+        (Arc<Language>, Vec<tree_sitter::Range>, Option<Range<usize>>),
+    >,
     queue: &mut BinaryHeap<ParseStep>,
 ) {
     let mut query_cursor = QueryCursorHandle::new();
@@ -1548,19 +1551,9 @@ fn get_injections(
                 .now_or_never()
                 .and_then(|language| language.ok())
         {
-            combined_injection_ranges.insert(language.id, (language, Vec::new()));
+            combined_injection_ranges.insert((language.id, None), (language, Vec::new(), None));
         }
     }
-
-    // When `@injection.host` is used, content ranges sharing the same host node
-    // are merged into a single injection layer (per host node), rather than being
-    // combined globally like `injection.combined`.
-    struct HostGroupEntry {
-        language: ParseStepLanguage,
-        content_ranges: Vec<tree_sitter::Range>,
-        step_range: Range<usize>,
-    }
-    let mut host_grouped: HashMap<usize, HostGroupEntry> = HashMap::default();
 
     for query_range in changed_ranges {
         query_cursor.set_byte_range(query_range.start.saturating_sub(1)..query_range.end + 1);
@@ -1588,7 +1581,6 @@ fn get_injections(
             prev_match = Some((mat.pattern_index, content_range.clone()));
             let combined = config.patterns[mat.pattern_index].combined;
 
-            // Check if this match has a host node for per-host grouping.
             let host_node = config
                 .host_capture_ix
                 .and_then(|ix| mat.nodes_for_capture_index(ix).next());
@@ -1623,32 +1615,17 @@ fn get_injections(
                     .and_then(|language| language.ok());
                 let range = text.anchor_before(step_range.start)..text.anchor_after(step_range.end);
 
-                // If there's a host node, group content ranges by host node.
-                if let Some(host_node) = host_node {
-                    let host_key = host_node.start_byte();
-                    let host_byte_range = host_node.byte_range();
-                    let entry = host_grouped.entry(host_key).or_insert_with(|| {
-                        let language = if let Some(language) = &language {
-                            ParseStepLanguage::Loaded {
-                                language: language.clone(),
-                            }
-                        } else {
-                            ParseStepLanguage::Pending {
-                                name: language_name.clone().into(),
-                            }
-                        };
-                        HostGroupEntry {
-                            language,
-                            content_ranges: Vec::new(),
-                            step_range: host_byte_range,
-                        }
-                    });
-                    entry.content_ranges.extend(content_ranges);
-                } else if let Some(language) = language {
-                    if combined {
+                if let Some(language) = language {
+                    if let Some(host_node) = host_node {
+                        let key = (language.id, Some(host_node.start_byte()));
+                        let entry = combined_injection_ranges.entry(key).or_insert_with(|| {
+                            (language.clone(), Vec::new(), Some(host_node.byte_range()))
+                        });
+                        entry.1.extend(content_ranges);
+                    } else if combined {
                         combined_injection_ranges
-                            .entry(language.id)
-                            .or_insert_with(|| (language.clone(), vec![]))
+                            .entry((language.id, None))
+                            .or_insert_with(|| (language.clone(), Vec::new(), None))
                             .1
                             .extend(content_ranges);
                     } else {
@@ -1675,36 +1652,30 @@ fn get_injections(
         }
     }
 
-    // Flush host-grouped injections into ParseSteps.
-    for (_, mut entry) in host_grouped.drain() {
-        entry.content_ranges.sort_unstable_by(|a, b| {
-            Ord::cmp(&a.start_byte, &b.start_byte).then_with(|| Ord::cmp(&a.end_byte, &b.end_byte))
-        });
-        let range =
-            text.anchor_before(entry.step_range.start)..text.anchor_after(entry.step_range.end);
-        queue.push(ParseStep {
-            depth,
-            language: entry.language,
-            included_ranges: entry.content_ranges,
-            range,
-            mode: ParseMode::Single,
-        });
-    }
-
-    for (_, (language, mut included_ranges)) in combined_injection_ranges.drain() {
+    for (_, (language, mut included_ranges, host_range)) in combined_injection_ranges.drain() {
         included_ranges.sort_unstable_by(|a, b| {
             Ord::cmp(&a.start_byte, &b.start_byte).then_with(|| Ord::cmp(&a.end_byte, &b.end_byte))
         });
-        queue.push(ParseStep {
-            depth,
-            language: ParseStepLanguage::Loaded { language },
-            range: outer_range.clone(),
-            included_ranges,
-            mode: ParseMode::Combined {
-                parent_layer_range: node.start_byte()..node.end_byte(),
-                parent_layer_changed_ranges: changed_ranges.to_vec(),
-            },
-        })
+        if let Some(host_range) = host_range {
+            queue.push(ParseStep {
+                depth,
+                language: ParseStepLanguage::Loaded { language },
+                range: text.anchor_before(host_range.start)..text.anchor_after(host_range.end),
+                included_ranges,
+                mode: ParseMode::Single,
+            });
+        } else {
+            queue.push(ParseStep {
+                depth,
+                language: ParseStepLanguage::Loaded { language },
+                range: outer_range.clone(),
+                included_ranges,
+                mode: ParseMode::Combined {
+                    parent_layer_range: node.start_byte()..node.end_byte(),
+                    parent_layer_changed_ranges: changed_ranges.to_vec(),
+                },
+            });
+        }
     }
 }
 
