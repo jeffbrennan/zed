@@ -31,4 +31,5 @@
     ]
     (#match? @comment "^(#|#\\s+)(?i:sql)\\s*$")
     (#set! injection.language "sql")
+    (#set! injection.combined)
 )
